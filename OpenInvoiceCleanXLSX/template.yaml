@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  openInvoiceCleaningLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openinvoice_cleaning_lambda
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: .
+      Timeout: 900
+      MemorySize: 800
+      ReservedConcurrentExecutions: 5 # max DB connections
+
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OIQueue.Arn
+            # event contains one message per invocation.
+            # if one fails the other jobs in the queue remain completely unaffected.
+            BatchSize: 1
+            # It will only allow 5 messages at a time to be processed.
+            # The rest will sit quietly in queue.
+            # This guarantees the MySQL database will only get 5 active write connections from this workflow.
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+      # Layers MUST be at this indentation level (under Properties)
+      Layers:
+        # This AWS SDK for Pandas layer often replaces pandas, numpy, openpyxl and pyarrow
+        - arn:aws:lambda:ca-central-1:336392948345:layer:AWSSDKPandas-Python313:1
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-openinvoice-reports
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: arn:aws:s3:::emi-openinvoice-reports/*
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: arn:aws:s3:::emi-v3/openinvoice_parquets/*
+            - Effect: Allow
+              Action:
+                - glue:GetTable
+                - glue:CreateTable
+                - glue:UpdateTable
+                - glue:GetDatabase
+              Resource: "*"
+
+      VpcConfig:
+        SubnetIds:
+          - subnet-0459e0e1e4350b48d
+          - subnet-07c34b276def4f14c
+        SecurityGroupIds:
+          - sg-0445c964e4ba68ce4
+
+  OIQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: openinvoice-pipeline-queue
+      VisibilityTimeout: 960 # must be >= Lambda timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OIDLQ.Arn
+        # failed messages are put back in SQS for retry.
+        # If a single message fails 3 times --> DLQ & SNS alarm
+        maxReceiveCount: 3
+
+  OIDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: openinvoice-pipeline-dlq
+
+  OIQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OIQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OIQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: arn:aws:s3:::emi-openinvoice-reports
+
+  # --- RESOURCE SNS DLQ email alert ---
+  # The Alert Topic
+  DlqAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: "vivian.cao@entermyinvoice.com"
+
+  # ALARM: For the OIDLQ
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "OpenInvoice-DLQ-Alarm"
+      AlarmDescription: "Alert if lambda fails"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OIDLQ.QueueName
+      Statistic: Sum
+      Period: 60 # 1 min
+      EvaluationPeriods: 2 # Must be bad for 2 minutes in a row
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DlqAlertTopic

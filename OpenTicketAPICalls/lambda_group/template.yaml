@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  # Fanout lambda (1)
+  openTicketAPIFanoutLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openticket_api_fanout_lambda
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: lambda_fanout/
+      Timeout: 900
+      MemorySize: 128
+
+      # Triggered by EnventBridge, auto run lambda 1
+      # starts counting from the moment it is deployed
+      Events:
+        ScheduledRun:
+          Type: Schedule
+          Properties:
+            Schedule: rate(7 days)
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OpenTicketQueue.QueueName
+
+      Environment:
+        Variables:
+          QUEUE_URL: !GetAtt OpenTicketQueue.QueueUrl
+
+  # worker lambda (2)
+  openTicketAPIWorkerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openticket_api_worker_lambda
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: lambda_worker/
+      Timeout: 900
+      MemorySize: 800
+      # Lambda will never run more than 5 concurrent executions total
+      # applies to ALL triggers (SQS, API Gateway, cron, etc.)
+      # acts as a safety limit at the function level
+      ReservedConcurrentExecutions: 5 # max DB connections
+
+      # Layers MUST be at this indentation level (under Properties)
+      Layers:
+        # This AWS SDK for Pandas layer often replaces pandas, numpy, openpyxl and pyarrow
+        - arn:aws:lambda:ca-central-1:336392948345:layer:AWSSDKPandas-Python313:1
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OpenTicketQueue.Arn
+            # event contains one message from the fanout lambda (SQS message) for one supplier with one time period.
+            # if one supplier's API crashes or times out, only that single supplier's job fails. The other jobs in the queue remain completely unaffected.
+            BatchSize: 1
+            # cap specific to this SQS trigger only
+            # It will only allow 5 messages at a time to be processed by the Worker Lambda, the rest wait in queue.
+            # This guarantees the MySQL database will only get 5 active write connections from this workflow.
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-v3
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: arn:aws:s3:::emi-v3/*
+            - Effect: Allow
+              Action:
+                - glue:GetTable
+                - glue:CreateTable
+                - glue:UpdateTable
+                - glue:GetDatabase
+              Resource: "*"
+        - SSMParameterReadPolicy:
+            ParameterName: emi-v3/oildex/*
+      VpcConfig:
+        SubnetIds:
+          - subnet-0459e0e1e4350b48d
+          - subnet-07c34b276def4f14c
+        SecurityGroupIds:
+          - sg-0445c964e4ba68ce4
+
+  # --- RESOURCE The Main SQS Queue ---
+  OpenTicketQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: openticket-worker-queue
+      VisibilityTimeout: 960 # must be higher than Lambda timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OTDLQ.Arn
+        # failed messages are put back in SQS for retry.
+        # If a single message fails 3 times --> DLQ & SNS alarm
+        maxReceiveCount: 3
+
+  # --- RESOURCE The Dead Letter Queue (The Lost & Found) ---
+  OTDLQ:
+    Type: AWS::SQS::Queue
+
+  # --- RESOURCE SNS DLQ email alert ---
+  # The Alert Topic
+  DlqAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: "vivian.cao@entermyinvoice.com"
+
+  # ALARM: For the OTDLQ
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "OpenTicket-API-DLQ-Alarm" # Give them distinct names
+      AlarmDescription: "Alert if files API GET fails"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OTDLQ.QueueName
+      Statistic: Sum
+      Period: 60 # 1 min
+      EvaluationPeriods: 2 # Must be bad for 2 minutes in a row
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DlqAlertTopic
+
+  # Batch Backfill Fanout lambda (3)
+  openBatchBackfillFanoutLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openticket_batch_backfill_fanout_lambda
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: batch_backfill_handler/
+      Timeout: 600
+      MemorySize: 128
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OpenTicketBatchBackfillFanoutQueue.QueueName
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-v3
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: arn:aws:s3:::emi-v3/*
+
+      Environment:
+        Variables:
+          QUEUE_URL: !GetAtt OpenTicketBatchBackfillFanoutQueue.QueueUrl
+
+  # --- Batch Backfill fanout lambda SQS Queue ---
+  OpenTicketBatchBackfillFanoutQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: openticket-batch-backfill-fanout-queue
+      VisibilityTimeout: 960 # must be higher than Lambda timeout
+
+  # Batch Backfill Worker lambda (4)
+  openTicketBatchBackfillWorkerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openticket_batch_backfill_worker_lambda
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: batch_backfill_operation/
+      Timeout: 900
+      MemorySize: 800
+      # Lambda will never run more than 5 concurrent executions total
+      # applies to ALL triggers (SQS, API Gateway, cron, etc.)
+      # acts as a safety limit at the function level
+      ReservedConcurrentExecutions: 5 # max DB connections
+
+      # Layers MUST be at this indentation level (under Properties)
+      Layers:
+        # This AWS SDK for Pandas layer often replaces pandas, numpy, openpyxl and pyarrow
+        - arn:aws:lambda:ca-central-1:336392948345:layer:AWSSDKPandas-Python313:1
+
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OpenTicketBatchBackfillFanoutQueue.Arn
+            BatchSize: 10
+            # cap specific to this SQS trigger only
+            # It will only allow 5 messages at a time to be processed by the Worker Lambda, the rest wait in queue.
+            # This guarantees the MySQL database will only get 5 active write connections from this workflow.
+            ScalingConfig:
+              MaximumConcurrency: 5
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt BATCHDLQ.QueueName
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-v3
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: arn:aws:s3:::emi-v3/*
+
+      VpcConfig:
+        SubnetIds:
+          - subnet-0459e0e1e4350b48d
+          - subnet-07c34b276def4f14c
+        SecurityGroupIds:
+          - sg-0445c964e4ba68ce4
+
+  BATCHDLQ:
+    Type: AWS::SQS::Queue
+
+  # ALARM: For the BATCHDLQ
+  BatchDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "OpenTicket-Batch-Backfill-DLQ-Alarm" # Give them distinct names
+      AlarmDescription: "Alert if any database update fails"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt BATCHDLQ.QueueName
+      Statistic: Sum
+      Period: 60 # 1 min
+      EvaluationPeriods: 2 # Must be bad for 2 minutes in a row
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DlqAlertTopic
+
+  # For testing API in VPC
+  # worker lambda (5)
+  openInvoiceAPIWorkerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: openInvoice_api_worker_lambda
+      Runtime: python3.13
+      Handler: app.lambda_handler
+      CodeUri: openinvoice_lambda/
+      Timeout: 900
+      MemorySize: 400
+
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+        - Version: "2012-10-17" # Adding this helps pass Early Validation
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: arn:aws:s3:::emi-v3
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: arn:aws:s3:::emi-v3/openticket_parquets/*
+            - Effect: Allow
+              Action:
+                - glue:GetTable
+                - glue:CreateTable
+                - glue:UpdateTable
+                - glue:GetDatabase
+              Resource: "*"
+        - SSMParameterReadPolicy:
+            ParameterName: emi-v3/oildex/*
+      VpcConfig:
+        SubnetIds:
+          - subnet-0459e0e1e4350b48d
+          - subnet-07c34b276def4f14c
+        SecurityGroupIds:
+          - sg-0445c964e4ba68ce4
