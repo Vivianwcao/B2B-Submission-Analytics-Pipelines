@@ -39,7 +39,8 @@ QuickSight dataset refreshes trigger daily from the MySQL RDS views to load the 
 
 ## Pipeline Architecture & Data Flow
 
-![Pipeline Architecture Diagram](Enverus_submission_analytics_pipeline.jpg)
+<img width="2736" height="3280" alt="Enverus_submission_analytics_pipeline" src="https://github.com/user-attachments/assets/8d009d80-a6af-4a43-9805-619d1434389d" />
+
 
 ### Data Processing Stages
 
@@ -91,7 +92,14 @@ QuickSight dataset refreshes trigger daily from the MySQL RDS views to load the 
 
 QuickSight connects directly to the MySQL RDS SQL views and refreshes daily, powering an interactive 5-page dashboard built for executive decision-making and client reporting.
 
-*(Insert short video clip or GIF of the QuickSight Dashboard here)*
+[![Watch Demo](https://img.shields.io/badge/▶️_Watch_the_B2B_QuickSight_Dashboard_Video_Demo-B1F6FC?style=for-the-badge)](https://youtu.be/5PW44m2eUOg)
+
+<p align="center">
+  <a href="https://youtu.be/5PW44m2eUOg" target="_blank">
+    <img src="https://img.youtube.com/vi/5PW44m2eUOg/maxresdefault.jpg" alt="B2B QuickSight Dashboard Demo" width="100%" />
+  </a>
+</p>
+
 
 ### 5 Dedicated Dashboard Pages
 1. **Ticket Analytics:** Breakdown of ticket volumes, dollar values, approval durations, and status distribution comparisons (canceled, disputed, approved) by supplier and submission method.
