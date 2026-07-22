@@ -2,7 +2,7 @@
 ## Automated Dual-Source Ingestion & BI Reporting for OpenTicket & OpenInvoice Data
 
 ### Tech Stack & Tools
-* **Core AWS Services:** AWS Lambda, Amazon S3, Amazon SQS, AWS EventBridge, Amazon CloudWatch, Amazon SNS, AWS SSM Parameter Store
+* **Core AWS Services:** AWS Lambda, Amazon S3, Amazon SQS, AWS EventBridge, Amazon CloudWatch, Amazon SNS, AWS SSM Parameter Store, AWS VPC
 * **Database & Analytics:** Amazon RDS (MySQL), AWS Glue, Amazon Athena, Amazon QuickSight
 * **Languages & Libraries:** Python 3.13, Pandas, SQLAlchemy, PyMySQL, AWSWrangler, PyArrow, Requests, SAM CLI
 * **Upstream Sources:** OpenTicket API (mTLS), OpenInvoice (Power Automate / S3 XLSX exports)
@@ -16,8 +16,10 @@ EMI submits field service tickets and invoices on behalf of oil and gas supplier
 
 ### The Dual-Source Technical Challenge
 Although both platforms hold connected data, system access differs significantly between them:
-* **OpenTicket (Automated API Route):** EMI has direct API access authenticated via mutual TLS. This allows the pipeline to extract full historical audit logs, status changes, and granular creator metadata.
-* **OpenInvoice (S3 File Ingestion Route):** Direct API access is unavailable. OpenInvoice data is retrieved as multi-row Excel snapshot reports, downloaded via an automated Power Automate flow, and dropped into an S3 landing bucket. Due to file format limits, OpenInvoice only provides macro volume totals and lag metrics.
+* **OpenTicket (Automated API Route):** The API returns one JSON object per receipt containing the full history of that ticket, including all timestamps, statuses, and party information. This object updates whenever there is a change to that ticket. The API is accessed via mutual TLS using a client certificate registered with OpenInvoice.
+* **OpenInvoice (S3 File Ingestion Route):** Direct API access is unavailable. OpenInvoice data is retrieved as multi-row Excel reports, downloaded via an automated Power Automate flow, and dropped into an S3 landing bucket. Unlike the API, these reports are snapshot-based. Each time an invoice status changes, a new row is added. The same invoice number can appear across multiple rows with different statuses and owners.
+
+Joining these two sources into a clean, accurate, non-duplicated view required designing different deduplication and upsert strategies for each.
 
 ### Business Drivers & Key Analytics Metrics
 EMI previously tracked basic monthly submission totals, but management lacked an aggregated, cross-system view to answer key operational questions. The business owner needed deep analytics to uncover new revenue streams, optimize supplier entry habits, and accelerate cash flow:
@@ -55,25 +57,33 @@ QuickSight dataset refreshes trigger daily from the MySQL RDS views to load the 
 
 ## Key Engineering Decisions & Solutions
 
-### 1. Fanout Architecture over Monolithic Lambda Loops
-* **Challenge:** Each supplier API fetch operates independently and takes between 1 to 5 minutes. Processing 25+ suppliers sequentially inside a single Lambda function risked hitting the 15-minute AWS execution timeout and creating total pipeline failure if a single supplier API call hung.
-* **Solution:** Implemented a Fanout pattern via SQS. The controller Lambda completes in seconds, while SQS distributes processing across isolated worker Lambda invocations running in parallel with automatic retry capabilities.
+### 1. Fanout + SQS Architecture over Monolithic Lambda Loops
+* **Challenge:** Each supplier's API call is independent and takes between 1 to 5 minutes. A single Lambda looping through 25+ suppliers sequentially would risk hitting the 15-minute AWS execution timeout and would fail all suppliers if one timed out.
+* **Solution:** Used a Fanout pattern via SQS. The controller Lambda finishes in seconds by sending one message per supplier to an SQS queue. SQS then triggers separate worker Lambda invocations in parallel, giving each supplier isolated execution and failure handling.
 
-### 2. Migration to MySQL RDS over S3 / Athena
-* **Challenge:** The pipeline initially used Parquet files on S3 queried via Amazon Athena. However, frequent schema evolution required updating Glue Data Catalogs, backfilling historical Parquet files, and rewriting Athena views whenever new upstream fields were added.
-* **Solution:** Migrated the data warehouse layer to Amazon RDS (MySQL). Adding new metadata fields now requires a simple `ALTER TABLE ADD COLUMN` operation. Furthermore, performing complex `FULL OUTER JOIN` operations between tickets and invoices is faster and more maintainable in SQL than joining across separate Athena S3 datasets.
+### 2. Migration to MySQL RDS over S3 / Parquet / Athena
+* **Challenge:** The pipeline started with Parquet files on S3 and Athena views. However, OpenTicket and OpenInvoice have completely different data structures, and the client later requested a single joined view across both. Adding new fields required backfilling hundreds of Parquet files, updating Glue tables, and rewriting Athena views.
+* **Solution:** Migrated the data storage layer to Amazon RDS (MySQL). Adding a new field now only requires a simple `ALTER TABLE ADD COLUMN` command. Joining ticket and invoice data is also much cleaner and faster using standard SQL views inside MySQL than doing cross-dataset joins in Athena.
 
 ### 3. Last-Action Timestamp Upsert Logic
-* **Challenge:** The OpenTicket API returns the complete historical state of a receipt. Standard `INSERT` statements caused duplicate key errors, while blind overwrites ran the risk of overwriting fresh data with out-of-order stale payload responses.
-* **Solution:** Engineered an `ON DUPLICATE KEY UPDATE` strategy comparing incoming `last_action_timestamp` values against stored records. Fields are updated only if the incoming record contains a newer timestamp than the stored entry.
+* **Challenge:** The OpenTicket API returns the full history of a receipt, which can be re-fetched across multiple pipeline runs as statuses update. Standard `INSERT` queries fail on duplicate keys, while blind updates risk overwriting fresh data if payloads arrive out of order.
+* **Solution:** Built an `ON DUPLICATE KEY UPDATE` query that checks the incoming `last_action_timestamp`. Incoming fields are only overwritten if the incoming record's timestamp is newer than what is currently stored in the database.
 
-### 4. Staging Tables for Parallel Batch Updates
-* **Challenge:** Multiple worker Lambdas running concurrently need to write batch update JSON payload mappings back to MySQL without causing deadlock conditions or race conditions.
-* **Solution:** Each worker Lambda generates a uniquely named temporary staging table (`staging_{request_id}`), writes its local payload batch, executes the update join against the main table, and drops the staging table inside a `finally` block to guarantee clean execution.
+### 4. Staging Table Pattern for Parallel Batch Updates
+* **Challenge:** A secondary Lambda processes S3 JSON files to update `invoice_number` values on existing ticket rows. Because multiple workers run in parallel, updating the main table at the same time could lead to race conditions or deadlocks.
+* **Solution:** Each worker Lambda generates a uniquely named temporary staging table (`staging_{request_id}`), writes its local batch updates there, runs the update join against the main table, and drops the staging table inside a `finally` block to guarantee cleanup even if an error occurs.
 
 ### 5. Mutual TLS Authentication via SSM & `/tmp` Caching
-* **Challenge:** The OpenTicket API requires mTLS client certificate authentication. The Python `requests` library requires file system paths to the client certificate and private key, but environment variables only pass raw text strings.
-* **Solution:** Stored the encrypted certificate strings in AWS SSM Parameter Store. On Lambda cold start, credentials are written to the local `/tmp` execution directory as temporary files. The files persist across warm container re-invocations, minimizing SSM network calls.
+* **Challenge:** The OpenTicket API requires client certificate authentication. The certificate and private key are stored in SSM Parameter Store, but the Python `requests` library needs actual file paths (not raw text strings) for its SSL configuration.
+* **Solution:** Lambda fetches the certificate strings from SSM on startup and writes them as temporary files to `/tmp`. Because files persist across warm Lambda container invocations, the SSM fetch only happens during cold starts.
+
+### 6. VPC & IP Whitelisting for OpenInvoice
+* **Challenge:** The OpenInvoice platform requires all incoming API and file traffic to originate from specific, authorized IP addresses, which prevents standard public Lambda execution.
+* **Solution:** Configured the OpenInvoice Lambda inside a custom AWS VPC with dedicated security groups and static outbound Elastic IPs (via NAT Gateway), ensuring all outbound requests match the whitelisted IP addresses.
+
+### 7. DLQ + CloudWatch Alarms for Observability
+* **Challenge:** Need fast, reliable visibility into pipeline failures without swallowing errors inside custom `try/except` blocks.
+* **Solution:** Allowed Lambda exceptions to propagate naturally. SQS automatically retries failed messages up to 3 times before routing them to a Dead-Letter Queue (DLQ). A CloudWatch alarm monitors the DLQ and sends an SNS email alert within 2 minutes of any failure.
 
 ---
 
@@ -95,25 +105,24 @@ QuickSight connects directly to the MySQL RDS SQL views and refreshes daily, pow
 ## Repository Structure
 
 ```text
-
 ├── openticket_lambdas/  
-└────template.yaml                    # AWS SAM Infrastructure as Code template
-|    ├── samconfig.toml                   # SAM CLI deployment parameters
-|    └── lambda_fanout/                   # Lambda 1: Supplier iterator & SQS publisher
-|    |       ├── app.py
-|    |       └── requirements.txt
-|    └── lambda_worker/                   # Lambda 2: OpenTicket API extraction & MySQL upsert
-|    |       ├── app.py
-|    |       ├── api_helper.py                # mTLS SSL certificate handler & API requester
-|    |       ├── db_helper.py                 # SQLAlchemy engine & timestamp upsert logic
-|    |       └── requirements.txt
-|    ├── batch_backfill_handler/          # Lambda 3: S3 JSON batch publisher
-|    │       ├── app.py
-|    │       └── requirements.txt
-|    ├── batch_backfill_operation/        # Lambda 4: Reads JSON & updates DB via staging tables
-|    │       ├── app.py
-|    │       └── requirements.txt
-└── openinvoice_lambda/              # Lambda 5: S3 XLSX reader, dedup & MySQL upsert
+│   ├── template.yaml                    # AWS SAM Infrastructure as Code template
+│   ├── samconfig.toml                   # SAM CLI deployment parameters
+│   ├── lambda_fanout/                   # Lambda 1: Supplier iterator & SQS publisher
+│   │   ├── app.py
+│   │   └── requirements.txt
+│   ├── lambda_worker/                   # Lambda 2: OpenTicket API extraction & MySQL upsert
+│   │   ├── app.py
+│   │   ├── api_helper.py                # mTLS SSL certificate handler & API requester
+│   │   ├── db_helper.py                 # SQLAlchemy engine & timestamp upsert logic
+│   │   └── requirements.txt
+│   ├── batch_backfill_handler/          # Lambda 3: S3 JSON batch publisher
+│   │   ├── app.py
+│   │   └── requirements.txt
+│   └── batch_backfill_operation/        # Lambda 4: Reads JSON & updates DB via staging tables
+│       ├── app.py
+│       └── requirements.txt
+└── openinvoice_lambda/                  # Lambda 5: S3 XLSX reader, dedup & MySQL upsert
     ├── app.py
     └── requirements.txt
 ```
